@@ -11,7 +11,7 @@ import { PersistArticleDto } from './dto/persistArticle.dto';
 import { InjectRepository } from '@nestjs/typeorm';
 import { ArticleResponse } from './types/articleResponse.interface';
 import { ArticlesResponse } from './types/articlesResponse.interface';
-import { dataSource } from '../ormdatasource';
+import { dataSourceConnection } from '../datasourceConnection';
 
 @Injectable()
 export class ArticleService {
@@ -23,7 +23,7 @@ export class ArticleService {
   ) {}
 
   async findAll(userId: number, query: any): Promise<ArticlesResponse> {
-    const queryBuilder = (await dataSource)
+    const queryBuilder = (await dataSourceConnection)
       .getRepository(ArticleEntity)
       .createQueryBuilder('articles')
       .leftJoinAndSelect('articles.author', 'author');
@@ -48,6 +48,25 @@ export class ArticleService {
       });
     }
 
+    if (query.favorited) {
+      const user = await this.userRepository.findOne({
+        where: {
+          username: query.favorited,
+        },
+        relations: ['favorites'],
+      });
+
+      const favoriteArticlesIds = user.favorites.map(({ id }) => id);
+
+      if (favoriteArticlesIds.length) {
+        queryBuilder.andWhere('articles.id IN (:...ids)', {
+          ids: favoriteArticlesIds,
+        });
+      } else {
+        queryBuilder.andWhere('1=0'); // returns empty array of articles
+      }
+    }
+
     if (query.limit) {
       queryBuilder.limit(query.limit);
     }
@@ -56,9 +75,24 @@ export class ArticleService {
       queryBuilder.offset(query.offset);
     }
 
-    const articles = await queryBuilder.getMany();
+    const favoriteArticlesIds: number[] = [];
+    if (userId) {
+      const user = await this.userRepository.findOne({
+        where: {
+          id: userId,
+        },
+        relations: ['favorites'],
+      });
+      user.favorites.forEach(({ id }) => favoriteArticlesIds.push(id));
+    }
 
-    return { articles, articlesCount };
+    const articles = await queryBuilder.getMany();
+    const articleWithFavorites = articles.map((article) => {
+      const favorited = favoriteArticlesIds.includes(article.id);
+      return { ...article, favorite: favorited };
+    });
+
+    return { articles: articleWithFavorites, articlesCount };
   }
 
   async createArticle(
@@ -113,6 +147,61 @@ export class ArticleService {
     Object.assign(article, updateArticleDto);
 
     return await this.articleRepository.save(article);
+  }
+
+  async addArticleToFavorites(
+    userId: number,
+    slug: string,
+  ): Promise<ArticleEntity> {
+    const article = await this.getArticleBySlug(slug);
+    const user = await this.userRepository.findOne({
+      where: { id: userId },
+      relations: ['favorites'],
+    });
+
+    const isNotInfavorites =
+      user.favorites.findIndex(
+        (favoriteArticle) => favoriteArticle.id === article.id,
+      ) === -1;
+
+    if (isNotInfavorites) {
+      user.favorites.push(article);
+      article.favoritesCount++;
+      await Promise.all([
+        this.userRepository.save(user),
+        this.articleRepository.save(article),
+      ]);
+    }
+
+    return article;
+  }
+
+  async removeArticleFromFavorites(
+    userId: number,
+    slug: string,
+  ): Promise<ArticleEntity> {
+    const article = await this.getArticleBySlug(slug);
+    const user = await this.userRepository.findOne({
+      where: {
+        id: userId,
+      },
+      relations: ['favorites'],
+    });
+
+    const articleindex = user.favorites.findIndex(
+      (favoriteArticle) => favoriteArticle.id === article.id,
+    );
+
+    if (articleindex >= 0) {
+      user.favorites.splice(articleindex, 1);
+      article.favoritesCount--;
+      await Promise.all([
+        this.userRepository.save(user),
+        this.articleRepository.save(article),
+      ]);
+    }
+
+    return article;
   }
 
   buildArticleResponse(article: ArticleEntity): ArticleResponse {
